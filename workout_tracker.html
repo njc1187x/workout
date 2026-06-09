@@ -10,6 +10,7 @@
 <link rel="manifest" href="manifest.json">
 <link rel="apple-touch-icon" href="icon-192.png">
 <title>Workout Tracker</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <style>
 :root {
   --bg: #0f172a;
@@ -306,6 +307,19 @@ select {
   padding: 6px 0; opacity: 0.7;
 }
 
+.sync-badge {
+  font-size: 11px; color: var(--text-dim); padding: 4px 10px;
+  border-radius: var(--radius-sm); border: 1px solid var(--border);
+  background: var(--bg-soft); display: inline-flex; align-items: center; gap: 6px;
+}
+.sync-badge.syncing { color: var(--primary); border-color: var(--primary); }
+.sync-badge.ok { color: var(--success); border-color: var(--success); }
+.sync-badge.offline { color: var(--warning); border-color: var(--warning); }
+.sync-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; display: inline-block;
+}
+
 @media (max-width: 480px) {
   .container { padding: 12px; }
   .title { font-size: 16px; }
@@ -322,6 +336,7 @@ select {
       <div class="title">💪 Workout Tracker</div>
       <div class="subtitle">5-day · chest + arms emphasis</div>
     </div>
+    <div class="sync-badge" id="sync-badge"><span class="sync-dot"></span><span id="sync-text">Loading</span></div>
   </div>
   <div class="tabs" style="margin-bottom: 16px;">
     <button class="tab-btn active" data-tab="log">📝 Log</button>
@@ -433,7 +448,70 @@ const SEED_DATA = {
 };
 
 // ════════════════════════════════════════════════════════════════════
-// STORAGE
+// CLOUD CONFIG
+// ════════════════════════════════════════════════════════════════════
+const SUPABASE_URL = 'https://pzezpyvvrstfnmnsvhwf.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_F3HUMwLRZv-RTNeF0Ab3cA_XKFC2FED';
+
+const cloud = {
+  client: null,
+  available: false,
+  init() {
+    if (typeof window.supabase === 'undefined') {
+      console.warn('Supabase library not loaded — running in local-only mode');
+      return false;
+    }
+    try {
+      this.client = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+      this.available = true;
+      return true;
+    } catch (e) { console.error('Cloud init failed:', e); return false; }
+  },
+  async pullAll() {
+    if (!this.available) return null;
+    try {
+      const { data, error } = await this.client.from('workout_data').select('*');
+      if (error) throw error;
+      return data || [];
+    } catch (e) { console.error('Cloud pull failed:', e); return null; }
+  },
+  async push(key, value) {
+    if (!this.available) return false;
+    try {
+      const { error } = await this.client.from('workout_data')
+        .upsert({ key, value, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+      if (error) throw error;
+      return true;
+    } catch (e) { console.error('Cloud push failed for', key, e); return false; }
+  },
+  async remove(key) {
+    if (!this.available) return false;
+    try {
+      const { error } = await this.client.from('workout_data').delete().eq('key', key);
+      if (error) throw error;
+      return true;
+    } catch (e) { console.error('Cloud delete failed:', e); return false; }
+  },
+  async clearAll() {
+    if (!this.available) return false;
+    try {
+      const { error } = await this.client.from('workout_data').delete().neq('key', '___never___');
+      if (error) throw error;
+      return true;
+    } catch (e) { console.error('Cloud clearAll failed:', e); return false; }
+  }
+};
+
+function setSyncStatus(text, kind) {
+  const badge = document.getElementById('sync-badge');
+  const txt = document.getElementById('sync-text');
+  if (!badge || !txt) return;
+  txt.textContent = text;
+  badge.className = 'sync-badge' + (kind ? ' ' + kind : '');
+}
+
+// ════════════════════════════════════════════════════════════════════
+// STORAGE (localStorage + cloud sync)
 // ════════════════════════════════════════════════════════════════════
 const KEY_PREFIX = 'wt_v1_';
 const storage = {
@@ -443,11 +521,26 @@ const storage = {
       return v ? JSON.parse(v) : null;
     } catch (e) { console.error('get error:', e); return null; }
   },
-  set(key, val) {
+  // Local-only set — used during cloud sync to avoid push loops
+  setLocalOnly(key, val) {
     try { localStorage.setItem(KEY_PREFIX + key, JSON.stringify(val)); return true; }
     catch (e) { console.error('set error:', e); throw e; }
   },
-  remove(key) { try { localStorage.removeItem(KEY_PREFIX + key); } catch {} },
+  // Set with cloud push (fire-and-forget)
+  set(key, val) {
+    this.setLocalOnly(key, val);
+    if (cloud.available) {
+      setSyncStatus('Syncing', 'syncing');
+      cloud.push(key, val).then(ok => {
+        setSyncStatus(ok ? 'Synced' : 'Offline', ok ? 'ok' : 'offline');
+      });
+    }
+    return true;
+  },
+  remove(key) {
+    try { localStorage.removeItem(KEY_PREFIX + key); } catch {}
+    if (cloud.available) cloud.remove(key);
+  },
   list(prefix) {
     const keys = [];
     try {
@@ -465,6 +558,7 @@ const storage = {
       if (k && k.startsWith(KEY_PREFIX)) toRemove.push(k);
     }
     toRemove.forEach(k => localStorage.removeItem(k));
+    if (cloud.available) cloud.clearAll();
   }
 };
 
@@ -1460,22 +1554,18 @@ function attachEventListeners() {
 // ════════════════════════════════════════════════════════════════════
 // INIT
 // ════════════════════════════════════════════════════════════════════
-function init() {
+function loadLocalData() {
+  state.allLogs = {};
+  state.allBW = {};
   const mw = storage.get('maxWeek');
   if (mw) state.maxWeek = mw;
-
   storage.list('log:').forEach(k => { const v = storage.get(k); if (v) state.allLogs[k] = v; });
   storage.list('bw:').forEach(k => { const v = storage.get(k); if (v) state.allBW[k] = v; });
+}
 
+function determineInitialWeek() {
   if (Object.keys(state.allLogs).length === 0) {
-    Object.entries(SEED_DATA).forEach(([day, exercises]) => {
-      const key = lk(1, day);
-      const log = { exercises, savedAt: new Date().toISOString() };
-      try { storage.set(key, log); state.allLogs[key] = log; }
-      catch (e) { console.error('Seed write failed:', e); }
-    });
-    try { storage.set(bk(1, 1), { weight: 138.8 }); state.allBW[bk(1, 1)] = { weight: 138.8 }; } catch {}
-    state.curWeek = 2;
+    state.curWeek = 1;
   } else {
     const hi = Object.keys(state.allLogs).reduce((mx, k) => {
       const m = k.match(/W(\d+)/);
@@ -1484,11 +1574,115 @@ function init() {
     if (hi > state.maxWeek) state.maxWeek = hi;
     state.curWeek = Math.min(state.maxWeek, hi + 1 > state.maxWeek ? state.maxWeek : hi + 1) || 1;
   }
+}
 
+function seedLocally() {
+  Object.entries(SEED_DATA).forEach(([day, exercises]) => {
+    const key = lk(1, day);
+    const log = { exercises, savedAt: new Date().toISOString() };
+    try { storage.setLocalOnly(key, log); state.allLogs[key] = log; }
+    catch (e) { console.error('Seed write failed:', e); }
+  });
+  try { storage.setLocalOnly(bk(1, 1), { weight: 138.8 }); state.allBW[bk(1, 1)] = { weight: 138.8 }; } catch {}
+  state.curWeek = 2;
+}
+
+async function pushAllLocalToCloud() {
+  if (!cloud.available) return;
+  const promises = [];
+  Object.entries(state.allLogs).forEach(([k, v]) => promises.push(cloud.push(k, v)));
+  Object.entries(state.allBW).forEach(([k, v]) => promises.push(cloud.push(k, v)));
+  if (state.maxWeek !== 12) promises.push(cloud.push('maxWeek', state.maxWeek));
+  await Promise.all(promises);
+}
+
+async function init() {
+  setSyncStatus('Loading', 'syncing');
+  cloud.init();
+
+  // Always load whatever is in localStorage first (fast UI on slow networks)
+  loadLocalData();
   state.progressEx = ALL_EX.find(n => n !== 'Situps' && n !== 'Close-grip pushups');
-  initSessionData();
   attachEventListeners();
+  determineInitialWeek();
+  initSessionData();
   render();
+
+  // Now do the cloud sync
+  if (!cloud.available) {
+    setSyncStatus('Local only', 'offline');
+    if (Object.keys(state.allLogs).length === 0) {
+      seedLocally();
+      determineInitialWeek();
+      initSessionData();
+      render();
+    }
+    return;
+  }
+
+  setSyncStatus('Syncing', 'syncing');
+  const cloudRows = await cloud.pullAll();
+
+  if (cloudRows === null) {
+    // Network error
+    setSyncStatus('Offline', 'offline');
+    if (Object.keys(state.allLogs).length === 0) {
+      seedLocally();
+      determineInitialWeek();
+      initSessionData();
+      render();
+    }
+    return;
+  }
+
+  if (cloudRows.length === 0) {
+    // Cloud is empty
+    if (Object.keys(state.allLogs).length === 0) {
+      // Both empty — seed locally then push
+      seedLocally();
+      determineInitialWeek();
+      initSessionData();
+      render();
+    }
+    // Push everything we have up
+    await pushAllLocalToCloud();
+    setSyncStatus('Synced', 'ok');
+    return;
+  }
+
+  // Cloud has data — replace local with cloud
+  const localKeys = new Set([...Object.keys(state.allLogs), ...Object.keys(state.allBW)]);
+  const cloudKeys = new Set(cloudRows.map(r => r.key));
+
+  state.allLogs = {};
+  state.allBW = {};
+  cloudRows.forEach(row => {
+    const k = row.key;
+    try {
+      storage.setLocalOnly(k, row.value);
+      if (k.startsWith('log:')) state.allLogs[k] = row.value;
+      else if (k.startsWith('bw:')) state.allBW[k] = row.value;
+      else if (k === 'maxWeek') state.maxWeek = row.value;
+    } catch (e) { console.error(e); }
+  });
+
+  // If local had any keys not in cloud (offline writes), push them up now
+  const orphans = [...localKeys].filter(k => !cloudKeys.has(k));
+  if (orphans.length > 0) {
+    for (const k of orphans) {
+      const v = storage.get(k);
+      if (v) {
+        await cloud.push(k, v);
+        if (k.startsWith('log:')) state.allLogs[k] = v;
+        else if (k.startsWith('bw:')) state.allBW[k] = v;
+      }
+    }
+  }
+
+  determineInitialWeek();
+  initSessionData();
+  render();
+  setSyncStatus('Synced', 'ok');
 }
 
 document.addEventListener('DOMContentLoaded', init);
