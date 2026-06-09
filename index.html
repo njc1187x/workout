@@ -957,7 +957,8 @@ function renderLogTab() {
     '<div class="session-meta">' +
       (state.sessionIsSkipped
         ? '<button class="skip-btn" data-action="unskip">Restore</button>'
-        : '<button class="skip-btn" data-action="skip">⏭ Skip day</button>') +
+        : '<button class="skip-btn" data-action="clear-day">🗑 Clear</button>' +
+          '<button class="skip-btn" data-action="skip">⏭ Skip day</button>') +
       '<span class="saved-badge" id="saved-badge">✓ Saved</span>' +
     '</div>' +
   '</div>';
@@ -1596,6 +1597,32 @@ async function unskipDay() {
   }
 }
 
+async function clearDay() {
+  if (!confirm('Delete all data for Week ' + state.curWeek + ' Day ' + state.curDay + '? This cannot be undone.')) return;
+  state.saving = true;
+  setSyncStatus('Saving', 'syncing');
+  try {
+    const logKey = lk(state.curWeek, state.curDay);
+    const bwKey = bk(state.curWeek, state.curDay);
+    if (state.allLogs[logKey]) {
+      await storeDelete(logKey);
+      delete state.allLogs[logKey];
+    }
+    if (state.allBW[bwKey]) {
+      await storeDelete(bwKey);
+      delete state.allBW[bwKey];
+    }
+    state.dirty = false;
+    setSyncStatus('Synced', 'ok');
+    loadCurrentSession();
+  } catch (e) {
+    alert('Failed to clear: ' + (e.message || 'unknown'));
+    setSyncStatus('Error', 'offline');
+  } finally {
+    state.saving = false;
+  }
+}
+
 async function resetData() {
   if (!confirm('Delete ALL workout data? This cannot be undone.')) return;
   try {
@@ -1676,6 +1703,7 @@ function attachEventListeners() {
       else if (action === 'export-csv') exportCSV();
       else if (action === 'skip') skipDay();
       else if (action === 'unskip') unskipDay();
+      else if (action === 'clear-day') clearDay();
       return;
     }
     const mode = t.closest('[data-mode]');
